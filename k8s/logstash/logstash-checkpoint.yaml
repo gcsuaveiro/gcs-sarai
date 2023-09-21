@@ -1,0 +1,913 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-checkpoint
+spec:
+  count: 3
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx2g -Xms2g"
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 4Gi
+  config:
+    pipeline.workers: 16
+    pipeline.batch.size: 1000
+    pipeline.batch.delay: 50
+  pipelines:
+    - pipeline.id: checkpoint
+      config.string: |
+        input {
+          kafka {
+            bootstrap_servers => "${KAFKA_HOST}:${KAFKA_PORT}"
+            topics => ["ingest-filebeat-checkpoint"]
+            decorate_events => "none"
+            codec => "json"
+            enable_auto_commit => true
+            auto_offset_reset => "earliest"
+            group_id => "logstash_SARAI_checkpoint_consumer_group"
+            client_id => "${HOSTNAME}"
+          }
+        }
+        filter {
+          if [message] == "" { drop {} }
+
+          mutate {
+            rename => {
+              "[message]" => "[event][original]"
+              "[@timestamp]" => "[event][created]"
+            }
+            remove_field => [ "[log]", "[host]" ]
+          }
+          
+          grok {
+            match => { "[event][original]" => "<%{NUMBER}\>%{SYSLOGTIMESTAMP} %{SYSLOGHOST} (LEEF:%{NOTSPACE}\|%{DATA}\|%{DATA}\|%{DATA}\|%{DATA}\|)?%{GREEDYDATA:[data][raw]}" }
+          }
+
+          mutate {
+            gsub => [ "[data][raw]", '\t(?![a-zA-Z_:\-]+=)', '%5Ct' ]
+          }
+
+          kv {
+            source => "[data][raw]"
+            target => "[checkpoint]"
+            field_split => "\t"
+            value_split => "="
+            allow_duplicate_values => true
+            exclude_keys => [ "flags", "layer_uuid", "originsicname", "__policy_id_tag", "version", "rounded_bytes", "db_tag", "update_service" ]
+            remove_field => [ "[data][raw]" ]
+          }
+
+          date {
+            target => "[@timestamp]"
+            timezone => "UTC"
+            match => [ "[checkpoint][devTime]", "UNIX" ]
+          }
+
+          mutate {
+            strip => [
+              "[checkpoint][administrator]",
+              "[checkpoint][source_user_name]",
+              "[checkpoint][src_user_name]",
+              "[checkpoint][usrName]",
+              "[checkpoint][src_user_dn]",
+              "[destination][user][name]"
+            ]
+          }
+
+          if [checkpoint][operation] and [checkpoint][operation] != "Log In" {
+            mutate { 
+              add_field => { "[event][category]" => "network" } 
+            }
+          }
+          else {
+            mutate { 
+              add_field => { "[event][category]" => "authentication" } 
+            }
+          }
+
+          mutate { 
+            add_field => { "[observer][vendor]" => "Checkpoint" } 
+          }
+
+          if ![observer][type] {
+            mutate { 
+              add_field => { "[observer][type]" => "firewall" } 
+            }
+          }
+
+          if [checkpoint][product] and [checkpoint][product] != "" {
+            mutate { 
+              add_field => { "[observer][product]" => "%{[checkpoint][product]}" } 
+            }
+          }
+
+          if [checkpoint][src] {
+            mutate { 
+              rename => { "[checkpoint][src]" => "[source][ip]" }
+            }
+          }
+
+          if ![source][ip] and [checkpoint][client_ip] {
+            mutate { 
+              rename => { "[checkpoint][client_ip]" => "[source][ip]" }
+            }
+          }
+
+          if [checkpoint][xlatesrc] and [checkpoint][xlatesrc] != "0.0.0.0"  {
+            mutate { 
+              rename => { "[checkpoint][xlatesrc]" => "[source][nat][ip]" }
+            }
+          }
+
+          if ![source][nat][ip] and [checkpoint][srcPostNAT] and [checkpoint][srcPostNAT] != "0.0.0.0" {
+            mutate { 
+              rename => { "[checkpoint][srcPostNAT]" => "[source][nat][ip]" }
+            }
+          }
+
+          if [checkpoint][dst] {
+            mutate { 
+              rename => { "[checkpoint][dst]" => "[destination][ip]" }
+            }
+          }
+
+          if [checkpoint][xlatedst] and [checkpoint][xlatedst] != "0.0.0.0"  {
+            mutate { 
+              rename => { "[checkpoint][xlatedst]" => "[destination][nat][ip]" }
+            }
+          }
+
+          if ![destination][nat][ip] and [checkpoint][dstPostNAT] and [checkpoint][dstPostNAT] != "0.0.0.0" {
+            mutate { 
+              rename => { "[checkpoint][dstPostNAT]" => "[destination][nat][ip]" }
+            }
+          }
+
+          if [checkpoint][uid] {
+            mutate { 
+              rename => { "[checkpoint][uid]" => "[source][user][id]" }
+            }
+          }
+
+          if [checkpoint][administrator] {
+            mutate { 
+              rename => { "[checkpoint][administrator]" => "[source][user][name]" }
+            }
+          }
+
+          if ![source][user][name] and [checkpoint][source_user_name] {
+            mutate { 
+              copy => { "[checkpoint][source_user_name]" => "[source][user][name]" }
+            }
+          } 
+
+          if ![source][user][name] and [checkpoint][src_user_name] {
+            mutate { 
+              copy => { "[checkpoint][src_user_name]" => "[source][user][name]" }
+            }
+          }
+
+          if [checkpoint][client_outbound_packets] {
+            mutate {
+              rename => { "[checkpoint][client_outbound_packets]" => "[source][packets]" }
+              convert => { "[source][packets]" => "integer" }
+            }
+          }
+
+          if [checkpoint][server_outbound_packets] {
+            mutate {
+              rename => { "[checkpoint][server_outbound_packets]" => "[destination][packets]" }
+              convert => { "[destination][packets]" => "integer" }
+            }
+          }
+
+          if [checkpoint][client_outbound_bytes] {
+            mutate {
+              rename => { "[checkpoint][client_outbound_bytes]" => "[source][bytes]" }
+              convert => { "[source][bytes]" => "integer" }
+            }
+          }
+
+          if ![source][bytes] and [checkpoint][sent_byte] {
+            mutate {
+              rename => { "[checkpoint][sent_byte]" => "[source][bytes]" }
+              convert => { "[source][bytes]" => "integer" }
+            }
+          }
+
+          if [checkpoint][server_outbound_bytes] {
+            mutate {
+              rename => { "[checkpoint][server_outbound_bytes]" => "[destination][bytes]" }
+              convert => { "[destination][bytes]" => "integer" }
+            }
+          }
+
+          if ![destination][bytes] and [checkpoint][received_bytes] {
+            mutate {
+              rename => { "[checkpoint][received_bytes]" => "[destination][bytes]" }
+              convert => { "[destination][bytes]" => "integer" }
+            }
+          }
+
+          if [checkpoint][service] {
+            mutate {
+              rename => { "[checkpoint][service]" => "[destination][port]" }
+              convert => { "[destination][port]" => "integer" }
+            }
+          }
+
+          if [checkpoint][xlatedport] and [checkpoint][xlatedport] != "0" {
+            mutate {
+              rename => { "[checkpoint][xlatedport]" => "[destination][nat][port]" }
+              convert => { "[destination][nat][port]" => "integer" }
+            }
+          } 
+
+          if ![destination][nat][port] and [checkpoint][dstPostNATPort] and [checkpoint][dstPostNATPort] != "0" {
+            mutate {
+              rename => { "[checkpoint][dstPostNATPort]" => "[destination][nat][port]" }
+              convert => { "[destination][nat][port]" => "integer" }
+            }
+          }
+
+          if [checkpoint][s_port] {
+            mutate {
+              rename => { "[checkpoint][s_port]" => "[source][port]" }
+              convert => { "[source][port]" => "integer" }
+            }
+          }
+
+          if ![source][port] and [checkpoint][srcPort] {
+            mutate {
+              rename => { "[checkpoint][srcPort]" => "[source][port]" }
+              convert => { "[source][port]" => "integer" }
+            }
+          }
+
+          if [checkpoint][xlatesport] and [checkpoint][xlatesport] != "0" {
+            mutate {
+              rename => { "[checkpoint][xlatesport]" => "[source][nat][port]" }
+              convert => { "[source][nat][port]" => "integer" }
+            }
+          } 
+
+          if ![source][nat][port] and [checkpoint][srcPostNATPort] and [checkpoint][srcPostNATPort] != "0" {
+            mutate {
+              rename => { "[checkpoint][srcPostNATPort]" => "[source][nat][port]" }
+              convert => { "[source][nat][port]" => "integer" }
+            }
+          }
+
+          if [checkpoint][mac_source_address] {
+            mutate {
+              rename => { "[checkpoint][mac_source_address]" => "[source][mac]" }
+            }
+          }
+
+          if [checkpoint][from] {
+            mutate {
+              rename => { "[checkpoint][from]" => "[source][user][email]" }
+            }
+          }
+
+          if [checkpoint][src_machine_name] {
+            mutate {
+              rename => { "[checkpoint][src_machine_name]" => "[source][domain]" }
+            }
+          }
+
+          if [checkpoint][destination_dns_hostname] {
+            mutate {
+              rename => { "[checkpoint][destination_dns_hostname]" => "[destination][domain]" }
+            }
+          }
+
+          if ![server][domain] and [checkpoint][dst_machine_name] {
+            mutate {
+              rename => { "[checkpoint][dst_machine_name]" => "[destination][domain]" }
+            }
+          }
+
+          if [checkpoint][src_user_group] {
+            mutate {
+              rename => { "[checkpoint][src_user_group]" => "[source][user][group][name]" }
+            }
+          }
+
+          if [checkpoint][rule_action] and [checkpoint][rule_action] in ["Accept", "Allow"] {
+            mutate {
+              add_field => { 
+                "[event][outcome]" => "success" 
+                "[event][type]" => [ "allowed", "connection" ]
+              }
+            }
+          }
+
+          if [checkpoint][audit_status] {
+            if [checkpoint][audit_status] == "Success" {
+              mutate { add_field => { "[event][outcome]" => "success" } }
+            }
+            else if [checkpoint][audit_status] == "Failure" {
+              mutate { add_field => { "[event][outcome]" => "failure" } }
+            }
+          }
+
+          if [checkpoint][rule_action] and [checkpoint][rule_action] in ["Drop", "Reject", "Block", "Prevent"] {
+            mutate {
+              add_field => { 
+                "[event][outcome]" => "success"
+                "[event][type]" => [ "denied", "connection" ] 
+              }
+            }
+          }
+
+          if [checkpoint][rule_action] and [checkpoint][rule_action] in ["Prevent", "Detect", "Quarantine"] {
+            mutate {
+              replace => { "[event][kind]" => "alert" }
+            }
+          }
+
+          if ![event][kind] {
+            mutate {
+              replace => { "[event][kind]" => "event" }
+            }
+          }
+
+          if [checkpoint][malware_action] {
+            mutate {
+              add_field => { "[event][category]" => "malware" }
+            }
+          }
+
+          if [checkpoint][rule_action] and [checkpoint][rule_action] in ["Detect", "Prevent"] {
+            mutate {
+              add_field => { "[event][category]" => "intrusion_detection" }
+            }
+          }
+
+          if [checkpoint][action] {
+            if [checkpoint][action] == "Log In" {
+              mutate {
+                replace => { "[event][outcome]" => "success" }
+                add_field => { 
+                  "[event][category]" => "authentication" 
+                  "[event][type]" => "allowed"
+                  "[checkpoint][action]" => "logged-in"
+                }
+              }
+            }
+            else if [checkpoint][action] == "Failed Log In" {
+              mutate {
+                replace => { "[event][outcome]" => "failure" }
+                add_field => { 
+                  "[event][category]" => "authentication"
+                  "[event][type]" => "denied"
+                  "[checkpoint][action]" => "logon-failed" 
+                }
+              }
+            }
+          }
+
+          if [source][ip] {
+            mutate { add_field => { "[related][ip]" => "%{[source][ip]}" } }
+          }
+
+          if [source][nat][ip] {
+            mutate { add_field => { "[related][ip]" => "%{[source][nat][ip]}" } }
+          }
+
+          if [destination][ip] {
+            mutate { add_field => { "[related][ip]" => "%{[destination][ip]}" } }
+          }
+
+          if [destination][nat][ip] {
+            mutate { add_field => { "[related][ip]" => "%{[destination][nat][ip]}" } }
+          }
+
+          if [checkpoint][file_md5] {
+            mutate { add_field => { "[related][hash]" => "%{[checkpoint][file_md5]}" } }
+          }
+
+          if [checkpoint][file_sha1] {
+            mutate { add_field => { "[related][hash]" => "%{[checkpoint][file_sha1]}" } }
+          }
+
+          if [checkpoint][file_sha256] {
+            mutate { add_field => { "[related][hash]" => "%{[checkpoint][file_sha256]}" } }
+          }
+
+          mutate {
+            rename => {
+              "[checkpoint][to]" => "[destination][user][email]"
+              "[checkpoint][usercheck_incident_uid]" => "[destination][user][id]"
+              "[checkpoint][service_name]" => "[destination][service][name]"
+              "[checkpoint][mac_destination_address]" => "[destination][mac]"
+              "[checkpoint][dns_type]" => "[dns][question][type]"
+              "[checkpoint][domain_name]" => "[dns][question][name]"
+              "[checkpoint][dns_message_type]" => "[dns][type]"
+              "[checkpoint][tid]" => "[dns][id]"
+              "[checkpoint][loguid]" => "[event][id]"
+            }
+          }
+
+          if [checkpoint][sequencenum] {
+            mutate {
+              rename => { "[checkpoint][sequencenum]" => "[event][sequence]" }
+              convert => { "[event][sequence]" => "integer" }
+            }
+          }
+
+          if [checkpoint][severity] {
+            mutate {
+              rename => { "[checkpoint][severity]" => "[event][severity]" }
+              convert => { "[event][severity]" => "integer" }
+            }
+          }
+
+          mutate {
+            rename => {
+              "[checkpoint][action]" => "[event][action]"
+              "[checkpoint][packet_capture]" => "[event][url]"
+              "[checkpoint][start_time]" => "[event][start]"
+              "[checkpoint][last_detection]" => "[event][end]"
+              "[checkpoint][app_risk]" => "[event][risk_score]"
+
+              "[checkpoint][file_id]" => "[file][inode]"
+              "[checkpoint][file_type]" => "[file][type]"
+              "[checkpoint][file_name]" => "[file][name]"
+              "[checkpoint][file_md5]" => "[file][hash][md5]"
+              "[checkpoint][file_sha1]" => "[file][hash][sha1]"
+              "[checkpoint][file_sha256]" => "[file][hash][sha256]"
+
+              "[checkpoint][dlp_file_name]" => "[file][name]"
+              "[checkpoint][user_group]" => "[group][name]"
+              "[checkpoint][os_version]" => "[host][os][version]"
+
+              "[checkpoint][os_name]" => "[host][os][name]"
+              "[checkpoint][method]" => "[http][request][method]"
+              "[checkpoint][referrer]" => "[http][request][referrer]"
+
+              "[checkpoint][service_id]" => "[network][application]"
+              "[checkpoint][ifdir]" => "[network][direction]"
+              "[checkpoint][proto]" => "[network][iana_number]"
+            }
+          }
+
+          if ![event][start] and [checkpoint][first_detection] {
+            mutate { 
+              rename => { "[checkpoint][first_detection]" => "[event][start]" } 
+            }
+          }
+
+          if [checkpoint][file_size] {
+            mutate {
+              rename => { "[checkpoint][file_size]" => "[file][size]" }
+              convert => { "[file][size]" => "integer" }
+            }
+          }
+
+          if [checkpoint][bytes] {
+            mutate {
+              rename => { "[checkpoint][bytes]" => "[network][bytes]" }
+              convert => { "[network][bytes]" => "integer" }
+            }
+          }
+
+          ruby {
+            code => '
+              if event.get("[network][iana_number]")
+                iana_number = event.get("[network][iana_number]")
+                network_transport = ""
+
+                case iana_number
+                when "0"
+                  network_transport = "hopopt"
+                when "1"
+                  network_transport = "icmp"
+                when "2"
+                  network_transport = "igmp"
+                when "6"
+                  network_transport = "tcp"
+                when "8"
+                  network_transport = "egp"
+                when "17"
+                  network_transport = "udp"
+                when "47"
+                  network_transport = "gre"
+                when "50"
+                  network_transport = "esp"
+                when "58"
+                  network_transport = "ipv6-icmp"
+                when "112"
+                  network_transport = "vrrp"
+                when "132"
+                  network_transport = "sctp"
+                end
+
+                if network_transport != ""
+                  event.set("[network][transport]", network_transport)
+                end
+              end
+            '
+          }
+
+          if [checkpoint][packets] {
+            mutate {
+              rename => { "[checkpoint][packets]" => "[network][packets]" }
+              convert => { "[network][packets]" => "integer" }
+            }
+          }
+          
+          mutate {
+            rename => {
+              "[checkpoint][layer_name]" => "[network][name]"
+              "[checkpoint][app_name]" => "[network][application]"
+              "[checkpoint][client_inbound_interface]" => "[observer][ingress][interface][name]"
+              "[checkpoint][client_outbound_interface]" => "[observer][egress][interface][name]"
+              "[checkpoint][type]" => "[observer][type]"
+              "[checkpoint][origin]" => "[observer][name]"
+              "[checkpoint][mac_address]" => "[observer][mac]"
+              "[checkpoint][origin_ip]" => "[observer][ip]"
+              "[checkpoint][outzone]" => "[observer][egress][zone]"
+              "[checkpoint][inzone]" => "[observer][ingress][zone]"
+              "[checkpoint][update_version]" => "[observer][version]"
+              "[checkpoint][process_md5]" => "[process][hash][md5]"
+              "[checkpoint][process_name]" => "[process][name]"
+              "[checkpoint][parent_process_md5]" => "[process][parent][hash][md5]"
+              "[checkpoint][parent_process_name]" => "[process][parent][name]"
+              "[checkpoint][matched_category]" => "[rule][category]"
+              "[checkpoint][malware_action]" => "[rule][description]"
+              "[checkpoint][malware_rule_id]" => "[rule][id]"
+              "[checkpoint][objectname]" => "[rule][name]"
+              "[checkpoint][smartdefence_profile]" => "[rule][ruleset]"
+              "[checkpoint][rule_uid]" => "[rule][uuid]"
+              "[checkpoint][url]" => "[url][original]"
+              "[checkpoint][http_host]" => "[url][domain]"
+              "[checkpoint][web_client_type]" => "[user_agent][name]"
+              "[checkpoint][user_agent]" => "[user_agent][original]"
+              "[checkpoint][industry_reference]" => "[vulnerability][id]"
+              "[checkpoint][message]" => "[message]"
+            }
+          }
+
+          if ![observer][ingress][interface][name] and [checkpoint][ifname] and [network][direction] and [network][direction] == "inbound" {
+            mutate {
+              rename => { "[checkpoint][ifname]" => "[observer][ingress][interface][name]" }
+            }
+          }
+
+          if ![observer][egress][interface][name] and [checkpoint][ifname] and [network][direction] and [network][direction] == "outbound" {
+            mutate {
+              rename => { "[checkpoint][ifname]" => "[observer][egress][interface][name]" }
+            }
+          }
+
+          if [observer][mac] {
+            mutate { 
+              gsub => [ "[observer][mac]", '[:]', '-' ] 
+              uppercase => [ "[observer][mac]" ]
+            }
+          }
+
+          if ![observer][ip] and [checkpoint][endpoint_ip] {
+            mutate {
+              rename => { "[checkpoint][endpoint_ip]" => "[observer][ip]" }
+            }
+          }
+
+          if ![observer][egress][zone] and [checkpoint][security_outzone] {
+            mutate {
+              rename => { "[checkpoint][security_outzone]" => "[observer][egress][zone]" }
+            }
+          }
+
+          if ![observer][ingress][zone] and [checkpoint][security_inzone] {
+            mutate {
+              rename => { "[checkpoint][security_inzone]" => "[observer][ingress][zone]" }
+            }
+          }
+
+          if ![rule][category] and [checkpoint][categories] {
+            mutate {
+              rename => { "[checkpoint][categories]" => "[rule][category]" }
+            }
+          }
+
+          if ![rule][id] and [checkpoint][app_rule_id] {
+            mutate {
+              rename => { "[checkpoint][app_rule_id]" => "[rule][id]" }
+            }
+          }
+
+          if ![rule][name] and [checkpoint][rule_name] {
+            mutate {
+              rename => { "[checkpoint][rule_name]" => "[rule][name]" }
+            }
+          }
+
+          if ![rule][name] and [checkpoint][malware_rule_name] {
+            mutate {
+              rename => { "[checkpoint][malware_rule_name]" => "[rule][name]" }
+            }
+          }
+
+          if ![rule][name] and [checkpoint][app_rule_name] {
+            mutate {
+              rename => { "[checkpoint][app_rule_name]" => "[rule][name]" }
+            }
+          }
+
+          if ![rule][name] and [checkpoint][dlp_rule_name] {
+            mutate {
+              rename => { "[checkpoint][dlp_rule_name]" => "[rule][name]" }
+            }
+          }
+
+          if ![rule][ruleset] and [checkpoint][policy] {
+            mutate {
+              rename => { "[checkpoint][policy]" => "[rule][ruleset]" }
+            }
+          }
+
+          if ![rule][uuid] and [checkpoint][dlp_rule_uid] {
+            mutate {
+              rename => { "[checkpoint][dlp_rule_uid]" => "[rule][uuid]" }
+            }
+          }
+
+          if ![rule][uuid] and [checkpoint][dlp_rule_uid] {
+            mutate {
+              rename => { "[checkpoint][dlp_rule_uid]" => "[rule][uuid]" }
+            }
+          }
+
+          if ![url][original] and [checkpoint][resource] {
+            mutate {
+              rename => { "[checkpoint][resource]" => "[url][original]" }
+            }
+          }
+
+          if [checkpoint][time] {
+            date {
+              target => "[checkpoint][time]"
+              match => [ "[checkpoint][time]", "UNIX", "ISO8601" ]
+            }
+          }
+
+          if ![message] and [checkpoint][reason] {
+            mutate {
+              rename => { "[checkpoint][reason]" => "[message]" }
+            }
+          }
+
+          if ![message] and [checkpoint][subject] {
+            mutate {
+              rename => { "[checkpoint][subject]" => "[message]" }
+            }
+          }
+
+          if [checkpoint][sys_message] {
+            mutate {
+              gsub => [ "[checkpoint][sys_message]", '^:"', '' ]
+            }
+          }
+
+          if [source][user][name] {
+            grok {
+              match => { "[source][user][name]" => "%{DATA} \(%{DATA}@%{DATA:[source][user][domain]}\)" }
+              tag_on_failure => [ "source_user_domain_grok_parse_failure" ]
+            }
+            
+            mutate {
+              add_field => { "[related][user]" => "%{[source][user][name]}" }
+              copy => { "[source][user][name]" => "[user][name]" }
+            }
+          }
+
+          if [destination][user][name] {
+            mutate {
+              add_field => { "[related][user]" => "%{[destination][user][name]}" }
+            }
+          }
+
+          if [source][bytes] and [destination][bytes] and ![network][bytes] {
+            ruby { code => 'event.set("[network][bytes]", event.get("[source][bytes]") + event.get("[destination][bytes]"))' }
+          }
+
+          if [source][packets] and [destination][packets] and ![network][packets] {
+            ruby { code => 'event.set("[network][packets]", event.get("[source][packets]") + event.get("[destination][packets]"))' }
+          }
+
+          if [checkpoint][action_reason] and [checkpoint][action_reason] =~ " " {
+            mutate {
+              rename => { "[checkpoint][action_reason]" => "[checkpoint][action_reason_msg]" }
+            }
+          }
+
+          if ![source][geo] and [source][ip] {
+            cidr {
+              address => [ "%{[source][ip]}" ]
+              network => [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fe80::/64" ]
+              add_tag => [ "private_source_ip" ]
+            }
+            
+            if "private_source_ip" not in [tags] {
+              geoip {
+                source => "[source][ip]"
+                target => "[source]"
+                default_database_type => "City"
+              }
+              geoip {
+                source => "[source][ip]"
+                target => "[source]"
+                default_database_type => "ASN"
+                fields => [ "AUTONOMOUS_SYSTEM_NUMBER", "AUTONOMOUS_SYSTEM_ORGANIZATION" ]
+              }
+            }
+          }
+
+          if ![destination][geo] and [destination][ip] {
+            cidr {
+              address => [ "%{[destination][ip]}" ]
+              network => [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fe80::/64" ]
+              add_tag => [ "private_destination_ip" ]
+            }
+            
+            if "private_destination_ip" not in [tags] {
+              geoip {
+                source => "[destination][ip]"
+                target => "[destination]"
+                default_database_type => "City"
+              }
+              geoip {
+                source => "[destination][ip]"
+                target => "[destination]"
+                default_database_type => "ASN"
+                fields => [ "AUTONOMOUS_SYSTEM_NUMBER", "AUTONOMOUS_SYSTEM_ORGANIZATION" ]
+              }
+            }
+          }
+
+          if [checkpoint][origin_sic_name] {
+            mutate { 
+              gsub => [ "[checkpoint][origin_sic_name]", '\\=', '=' ]
+            }
+          }
+
+          if [url][original] {
+            ruby {
+              code => '
+                url_original = event.get("[url][original]").split(" ")
+                event.set("[url][original]", url_original)
+                event.set("[host][name]", url_original[0])
+              '
+            }
+          }
+
+          if ![host][name] and [checkpoint][appi_name] {
+            ruby {
+              code => '
+                checkpoint_appi_name = event.get("[checkpoint][appi_name]")
+                if checkpoint_appi_name.is_a? Array
+                  checkpoint_appi_name = checkpoint_appi_name[0].split("/")
+                else
+                  checkpoint_appi_name = checkpoint_appi_name.split("/")
+                end
+                event.set("[host][name]", checkpoint_appi_name[0])
+              '
+            }
+          }
+
+          if ![host][name] and [source][ip] {
+            mutate {
+              copy => { "[source][ip]" => "[host][name]" }
+            }
+          }
+
+          if ![message] {
+            ruby {
+              code => '
+                if event.get("[event][action]")
+                  event_action = event.get("[event][action]")
+                  message = ""
+
+                  case message
+                  when "Accept"
+                    message = "Flow accepted"
+                  when "Allow"
+                    message = "Flow allowed"
+                  when "Ask User"
+                    message = "Ask User"
+                  when "Block"
+                    message = "Flow blocked"
+                  when "Bypass"
+                    message = "Rule bypassed"
+                  when "Decrypt"
+                    message = "Flow decrypted"
+                  when "Detect"
+                    message = "Anomally Detected"
+                  when "Drop"
+                    message = "Flow Dropped"
+                  when "Encrypt"
+                    message = "Flow encrypted"
+                  when "Failed Log In"
+                    message = "Failed Log In"
+                  when "Forgot Passcode"
+                    message = "Forgot Passcode"
+                  when "IP Changed"
+                    message = "IP Changed"
+                  when "Key Install"
+                    message = "Key installed"
+                  when "Log In"
+                    message = "Log In"
+                  when "Log Out"
+                    message = "Log Out"
+                  when "Prevent"
+                    message = "Flow prevented"
+                  when "Redirect"
+                    message = "Flow redirected"
+                  when "Reject"
+                    message = "Flow rejected"
+                  when "logged-in"
+                    message = "Logged in"
+                  when "logon-failed"
+                    message = "Logon failed"
+                  end
+
+                  if message != ""
+                    event.set("[message]", message)
+                  end
+                end
+              '
+            }
+          }
+
+          mutate {
+            remove_field => [
+              "[checkpoint][ifname]",
+              "[checkpoint][server_outbound_interface]",
+              "[checkpoint][client_outbound_packets]",
+              "[checkpoint][server_outbound_packets]",
+              "[checkpoint][client_outbound_bytes]",
+              "[checkpoint][server_outbound_bytes]",
+              "[checkpoint][client_inbound_packets]",
+              "[checkpoint][server_inbound_packets]",
+              "[checkpoint][client_inbound_bytes]",
+              "[checkpoint][server_inbound_bytes]",
+              "[checkpoint][sent_byte]",
+              "[checkpoint][received_bytes]",
+              "[checkpoint][service]",
+              "[checkpoint][xlatedport]",
+              "[checkpoint][s_port]",
+              "[checkpoint][xlatesport]",
+              "[checkpoint][contextnum]",
+              "[checkpoint][sequencenum]",
+              "[checkpoint][file_size]",
+              "[checkpoint][product]",
+              "[checkpoint][severity]",
+              "[checkpoint][xlatesrc]",
+              "[checkpoint][xlatedst]",
+              "[checkpoint][uid]",
+              "[checkpoint][time]",
+              "[checkpoint][__nsons]",
+              "[checkpoint][__p_dport]",
+              "[checkpoint][__pos]",
+              "[checkpoint][hll_key]",
+              "[checkpoint][segment_time]",
+              "[checkpoint][srcPostNAT]",
+              "[checkpoint][srcPostNATPort]",
+              "[checkpoint][dstPostNAT]",
+              "[checkpoint][dstPostNATPort]",
+              "[_temp_]"    
+            ]
+          }
+        }
+        output {
+          elasticsearch {
+            hosts => [ "${SARAI_ES_HOSTS}" ]
+            user => "${SARAI_ES_USER}"
+            password => "${SARAI_ES_PASSWORD}"
+            ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+            data_stream => "true"
+            data_stream_type => "logs"
+            data_stream_dataset => "checkpoint.firewall"
+            data_stream_namespace => "default"
+            pipeline => "dummy"
+            http_compression => true
+          }
+        }

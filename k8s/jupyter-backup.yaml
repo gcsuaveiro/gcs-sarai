@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jupyter-volume-backup
+spec:
+  schedule: "20 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: git-client
+              image: alpine/git
+              env:
+                - name: GIT_AUTHOR_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-credentials-backup
+                      key: GIT_AUTHOR_NAME
+                - name: GIT_AUTHOR_EMAIL
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-credentials-backup
+                      key: GIT_AUTHOR_EMAIL
+                - name: GITHUB_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-credentials-backup
+                      key: username
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-credentials-backup
+                      key: token
+                - name: GITHUB_REPO_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-credentials-backup
+                      key: GITHUB_REPO_NAME
+              command: ["/bin/sh"]
+              args:
+                - "-c"
+                - |
+                  CURRENT_DATE=$(date "+%Y-%m-%d_%H-%M-%S")
+                  git config --global user.name ${GIT_AUTHOR_NAME}
+                  git config --global user.email ${GIT_AUTHOR_EMAIL}
+                  git clone https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git
+                  cd ${GITHUB_REPO_NAME}
+                  git checkout -b ${CURRENT_DATE}
+                  cp -r /data/* .
+                  git add .
+                  git commit -m "Automated backup on ${CURRENT_DATE}"
+                  git push origin ${CURRENT_DATE}
+              volumeMounts:
+                - name: backup-notebooks
+                  mountPath: /data
+          volumes:
+            - name: backup-notebooks
+              persistentVolumeClaim:
+                claimName: jupyter-notebooks-pvc # Replace with your actual PersistentVolumeClaim (PVC) name
+          restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 172800

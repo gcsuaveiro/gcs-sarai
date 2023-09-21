@@ -1,0 +1,165 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jupyter
+  labels:
+    app: jupyter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyter
+  template:
+    metadata:
+      labels:
+        app: jupyter
+    spec:
+      initContainers:
+      - name: init-jupyter-container
+        image: bitnami/git
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            git clone https://github.com/Cyb3rWard0g/HELK.git /repo
+            cp -R /repo/docker/jupyter/notebooks /test/notebooks/
+        volumeMounts:
+          - name: notebooks
+            mountPath: "/test/notebooks/"
+            subPath: "notebooks"
+      - name: init-container
+        image: openjdk
+        command: ["sh", "-c"]
+        args:
+          - |
+            #!/bin/sh
+            set -e
+            # Fetch the CA certificate
+            cp /mnt/es-ca/ca.crt /tmp/ca.crt
+            # Convert CA certificate to Java keystore format
+            keytool -import -trustcacerts -alias elasticsearch -file /tmp/ca.crt -keystore /tmp/truststore.jks -storepass changeit -noprompt
+            # Store the truststore in the /truststore directory
+            cp /tmp/truststore.jks /truststore/truststore.jks
+            
+        volumeMounts:
+        - name: es-ca-volume
+          mountPath: /mnt/es-ca
+        - name: truststore-volume
+          mountPath: /truststore
+      containers:
+        - name: jupyter-container
+          #TODO adicionar pacotes de pip obrigatórios numa imagem custom: pip3 install elasticsearch-dsl
+          image: jupyter/all-spark-notebook:lab-3.2.4
+          #command: ["/bin/bash"]
+          #args: ["/opt/jupyter/scripts/jupyter-entrypoint.sh", "/opt/jupyter/scripts/jupyter-cmd.sh"]
+          env:
+            - name: JUPYTER_TYPE
+              value: "notebook"
+            - name: JUPYTER_BASE_URL
+              value: "/"
+          ports:
+            - containerPort: 8888
+            - containerPort: 4040
+          volumeMounts:
+            - name: notebooks
+              mountPath: "/home/jovyan/work/"
+              subPath: "notebooks"
+            - name: es-ca-volume
+              mountPath: "/mnt/ca.crt"
+              subPath: "tls.crt"
+              readOnly: true
+            - name: hive-config
+              mountPath: "/usr/local/spark/conf/hive-site.xml"
+              subPath: "hive.xml"
+            - name: truststore-volume
+              mountPath: /usr/local/spark/truststore.jks
+              subPath: "truststore.jks"
+      volumes:
+      - name: notebooks
+        persistentVolumeClaim:
+          claimName: jupyter-notebooks-pvc
+      - name: hive-config
+        configMap:
+          name: hive-config
+      - name: es-ca-volume
+        secret:
+        #TODO TEMPLATE talvez
+          secretName: elasticsearch-es-remote-ca
+      - name: truststore-volume
+        emptyDir: {}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: In
+                values: 
+                - "true"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hive-config
+data:
+  hive.xml: |
+    <configuration>
+      <property>
+        <name>javax.jdo.option.ConnectionURL</name>
+        <value>jdbc:postgresql://hive-postgresql:5432/hive</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionDriverName</name>
+        <value>org.postgresql.Driver</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionUserName</name>
+        <value>hive-spark</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionPassword</name>
+        <value>supersafe-passoword</value>
+      </property>
+    </configuration>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter-svc
+spec:
+  selector:
+    app: jupyter
+  ports:
+    - port: 8888
+      targetPort: 8888
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-ui-svc
+spec:
+  selector:
+    app: jupyter
+  ports:
+    - port: 4040
+      targetPort: 4040
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyter-ing
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: jupyter.example.com
+      http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: jupyter-svc
+              port:
+                number: 8888

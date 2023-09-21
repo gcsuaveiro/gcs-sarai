@@ -1,0 +1,135 @@
+# useless now that we have winlogbeat
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-dc-dbg
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx2g -Xms2g"
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 4Gi
+  pipelines:
+    - pipeline.id: dc
+      config.string: |
+        input {
+          kafka {
+            bootstrap_servers => "${KAFKA_HOST}:${KAFKA_PORT}"
+            topics => ["ingest-filebeat-dc", "ingest-filebeat-wauth"]
+            decorate_events => "basic"
+            codec => "json"
+            enable_auto_commit => true
+            auto_offset_reset => "earliest"
+            group_id => "logstash_SARAI_dc_consumer_group"
+          }
+        }
+        filter {
+          if [message] == "" { drop {} }
+
+          prune {
+            whitelist_names => [ "[message]" ]
+          }
+
+          mutate {
+            rename => { "[message]" => "[event][original]" }
+          }
+
+          grok {
+            match => { "[event][original]" => "%{SYSLOGTIMESTAMP:timestamp} %{SYSLOGHOST:logsource} %{GREEDYDATA:[data][raw]}" }
+          }
+
+          date {
+            match => [ "[timestamp]", "MMM d HH:mm:ss", "MMM  d HH:mm:ss" ]
+            target => "[@timestamp]"
+            timezone => "Europe/Lisbon"
+            remove_field => [ "[timestamp]" ]
+          }
+          
+          kv {
+            source => "[data][raw]"
+            target => "[winlog]"
+            field_split => "\t"
+            value_split => "="
+            allow_duplicate_values => true
+            remove_field => [ "[data][raw]" ]
+          }
+
+          # grok {
+          #   match => { "[winlog][Message]" => [
+          #     "%{DATA}Process Information:  Process ID:  %{BASE16NUM:[winlog][event_data][ProcessId]}  Process Name:  %{DATA:[winlog][event_data][ProcessName]}\s",
+          #     "%{DATA}Subject:  Security ID:  %{DATA:[winlog][event_data][SubjectUserSid]}  Account Name:  %{DATA:[winlog][event_data][SubjectUserName]}  Account Domain:  %{DATA:[winlog][event_data][SubjectDomainName]}  Logon ID:  %{BASE16NUM:[winlog][event_data][SubjectLogonId]}\s",
+          #     "%{DATA}Logon Information:  Logon Type:  %{DATA:[winlog][event_data][LogonType]}\s",
+          #     "%{DATA}Restricted Admin Mode: %{DATA:[winlog][event_data][RestrictedAdminMode]}\s",
+          #     "%{DATA}Virtual Account:  %{DATA:[winlog][event_data][VirtualAccount]}\s",
+          #     "%{DATA}Elevated Token:  %{DATA:[winlog][event_data][ElevatedToken]}\s",
+          #     "%{DATA}Impersonation Level:  %{DATA:[winlog][event_data][ImpersonationLevel]}\s",
+          #     "%{DATA}New Logon:  Security ID:  %{DATA:[winlog][event_data][TargetUserSid]}  Account Name:  %{DATA:[winlog][event_data][TargetUserName]}  Account Domain:  %{DATA:[winlog][event_data][TargetDomainName]}  Logon ID:  %{BASE16NUM:[winlog][event_data][TargetLogonId]}  Linked Logon ID:  %{BASE16NUM:[winlog][event_data][TargetLinkedLogonId]}  Network Account Name: %{DATA:[winlog][event_data][TargetOutboundUserName]}  Network Account Domain: %{DATA:[winlog][event_data][TargetOutboundDomainName]}\s",
+          #     "%{DATA}Network Information:  Workstation Name: %{DATA:[winlog][event_data][WorkstationName]}  Source Network Address: %{DATA:[winlog][event_data][IpAddress]} Source Port:  %{DATA:[winlog][event_data][IpPort]}\s"
+          #   ] }
+
+          #   pattern_definitions => { 
+          #     "WSPACE" => "\s+"
+          #   }
+            
+          #   break_on_match => false
+          #   tag_on_failure => []
+          # }
+
+          # mutate {
+          #   rename => {
+          #     "[winlog][Computer]" => "[winlog][computer_name]"
+          #     "[winlog][AgentLogFile]" => "[winlog][channel]"
+          #     "[winlog][Source]" => "[winlog][provider_name]"
+          #     "[winlog][Task]" => "[winlog][task]"
+          #     "[winlog][RecordNumber]" => "[winlog][record_id]"
+          #     "[winlog][OriginatingComputer]" => "[winlog][computer_ip]"
+          #     "[winlog][EventID]" => "[winlog][event_id]"
+          #   }
+          # }
+
+          prune {
+            whitelist_names => [ "[message]", "[winlog]" ]
+          }
+        }
+        output {
+          if [@metadata][kafka][topic] == "ingest-filebeat-dc" {
+            elasticsearch {
+              hosts => [ "${SARAI_ES_HOSTS}" ]
+              user => "${SARAI_ES_USER}"
+              password => "${SARAI_ES_PASSWORD}"
+              ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+              data_stream => "true"
+              data_stream_type => "logs"
+              data_stream_dataset => "dc.debug"
+              data_stream_namespace => "default"
+            }
+          }
+          else {
+            elasticsearch {
+              hosts => [ "${SARAI_ES_HOSTS}" ]
+              user => "${SARAI_ES_USER}"
+              password => "${SARAI_ES_PASSWORD}"
+              ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+              data_stream => "true"
+              data_stream_type => "logs"
+              data_stream_dataset => "wauth.debug"
+              data_stream_namespace => "default"
+            }
+          }
+        }

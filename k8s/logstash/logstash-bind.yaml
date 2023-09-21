@@ -1,0 +1,335 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-bind
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx1g -Xms1g"
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+        resources:
+          requests:
+            memory: 2Gi
+          limits:
+            memory: 2Gi
+  pipelines:
+    - pipeline.id: bind
+      config.string: |
+        # https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml
+        # https://kb.isc.org/docs/aa-00434
+        # https://superuser.com/questions/1264211/understanding-bind9-query-log
+        
+        input {
+          kafka {
+            bootstrap_servers => "${KAFKA_HOST}:${KAFKA_PORT}"
+            topics => ["ingest-filebeat-bind"]
+            decorate_events => "none"
+            codec => "json"
+            enable_auto_commit => true
+            auto_offset_reset => "earliest"
+            group_id => "logstash_SARAI_bind_consumer_group"
+          }
+        }
+        filter {
+          if [message] == "" { drop {} }
+
+          mutate {
+            rename => { "[message]" => "[event][original]" }
+            add_field => { 
+              "[event][kind]" => "event" 
+              "[event][module]" => "bind"
+              "[event][category]" => "network"
+              "[event][type]" => "access"
+              "[event][created]" => "%{+yyyy-MM-dd'T'HH:mm:ss.SSS'Z'}"
+              "[event][dataset]" => "bind"
+            }
+          }
+          
+          grok {
+            match => { 
+              "[event][original]" => [
+                "%{SYSLOGBASE} client( @%{DATA})? %{IP:[client][ip]}#%{NONNEGINT:[client][port]:int}( \(%{DATA}\))?:( view (?<[interface][alias]>%{WORD}):)? (?<[tmp][type]>query): (%{DATA:[dns][question][name]}) %{WORD:[dns][question][class]} (?<[dns][question][type]>[0-9a-zA-Z\-]+) (?<[tmp][dns_flags]>[+-]S?E?(?:\([0-9]+\))?T?D?C?V?K?) \(%{IP:[host][ip]}\)",
+                "%{SYSLOGBASE} client( @%{DATA})? %{IP:[client][ip]}#%{NONNEGINT:[client][port]:int}( \(%{DATA}\))?:( view (?<[interface][alias]>%{WORD}):)? (?<[tmp][type]>rpz) QNAME %{DATA} rewrite %{DATA:[dns][question][name]}/(?<[dns][question][type]>[0-9a-zA-Z\-]+)/%{WORD:[dns][question][class]} via %{DATA:[tmp][rpz_rewrite_name]}$",
+                "%{SYSLOGBASE} client( @%{DATA})? %{IP:[client][ip]}#%{NONNEGINT:[client][port]:int}( \(%{DATA}\))?:( view (?<[interface][alias]>%{WORD}):)? (?<[tmp][type]>received notify) for zone \'%{DATA:[dns][zone]}\'",
+                "%{SYSLOGBASE} zone %{DATA:[dns][zone]}/%{WORD:[dns][question][class]}/%{WORD:[interface][alias]}: (?<[tmp][type]>sending notifies) \(serial %{NUMBER}\)",
+                "%{SYSLOGBASE} (client( @%{DATA})? %{IP:[client][ip]}#%{NONNEGINT:[client][port]:int}( \(%{DATA}\))?:( view (?<[interface][alias]>%{WORD}):)? )?%{GREEDYDATA:[message]}"
+              ]
+              break_on_match => true
+            }
+          }
+
+          mutate { copy => { "[process][name]" => "[event][provider]" } }
+
+          if [tmp][type] == "query" or [tmp][type] == "rpz" {
+            mutate {
+              add_field => { 
+                "[event][action]" => "query_received"
+                "[dns][op_code]" => "QUERY"
+                "[dns][type]" => "query"
+              }
+            }
+          }
+          else if [tmp][type] == "received notify" {
+            mutate {
+              add_field => { 
+                "[event][action]" => "notify_received"
+                "[dns][op_code]" => "UPDATE"
+              }
+            }
+          }
+          else if [tmp][type] == "sending notifies" {
+            mutate {
+              add_field => { 
+                "[event][action]" => "notifies_sent"
+                "[dns][op_code]" => "UPDATE"
+              }
+            }
+          }
+
+          date {
+            match => [ "[timestamp]", "MMM d HH:mm:ss", "MMM  d HH:mm:ss" ]
+            target => "[@timestamp]"
+            timezone => "Europe/Lisbon"
+            remove_field => [ "[timestamp]" ]
+          }
+
+          if [interface][alias] == "external" and [client][ip] {
+            geoip {
+              source => "[client][ip]"
+              target => "[client]"
+              default_database_type => "City"
+            }
+            geoip {
+              source => "[client][ip]"
+              target => "[client]"
+              default_database_type => "ASN"
+              fields => [ "AUTONOMOUS_SYSTEM_NUMBER", "AUTONOMOUS_SYSTEM_ORGANIZATION" ]
+            }
+          }
+
+          if [tmp][dns_flags] {           
+            ruby {
+              code => '
+                dns_flags = event.get("[tmp][dns_flags]")
+                header_flags = []
+
+                if dns_flags.include? ?+
+                  header_flags.append("RD")
+                end
+
+                if dns_flags.include? ?D
+                  header_flags.append("DO")
+                end
+
+                if dns_flags.include? ?C
+                  header_flags.append("CD")
+                end
+
+                # logger.info("FLAGS: %s arr: %s" % [dns_flags, header_flags.to_s()])
+                if header_flags.size() > 0
+                  event.set("[dns][header_flags]", header_flags)
+                end
+              '
+            }
+          }
+
+          grok {
+            match => { "[dns][question][name]" => "(%{DATA:[dns][question][subdomain]}.)?%{REVIP:[tmp][reverse_ip]}.(?<[dns][question][top_level_domain]>in-addr.arpa|ip6.arpa)" }
+            pattern_definitions => { 
+              "REVIPV6" => "([0-9A-Fa-f].){31}([0-9A-Fa-f]){1}(?=\.ip6\.arpa)"
+              "REVIPV4" => "(?<![0-9])(?:(?:[0-1]?[0-9]{1,2}|2[0-4][0-9]|25[0-5])[.](?:[0-1]?[0-9]{1,2}|2[0-4][0-9]|25[0-5])[.](?:[0-1]?[0-9]{1,2}|2[0-4][0-9]|25[0-5])[.](?:[0-1]?[0-9]{1,2}|2[0-4][0-9]|25[0-5]))(?![0-9])(?=\.in-addr\.arpa)"
+              "REVIP" => "(?:%{REVIPV6}|%{REVIPV4})"
+            }
+            add_tag => ["reverse_dns_lookup"]
+            add_field => { "[dns][question][registered_domain]" => "%{[tmp][reverse_ip]}.%{[dns][question][top_level_domain]}" }
+            tag_on_failure => []
+          }
+
+          if "reverse_dns_lookup" in [tags] {
+            ruby {
+              code => '
+                reverse_ip = event.get("[tmp][reverse_ip]")
+                reverse_ip_split = reverse_ip.split(".")
+
+                result = nil
+                if reverse_ip_split.size() == 4
+                  result = "#{reverse_ip_split[3]}.#{reverse_ip_split[2]}.#{reverse_ip_split[1]}.#{reverse_ip_split[0]}"
+                elsif reverse_ip_split.size() == 32
+                  result = ""
+                  for i in 32.downto(1)
+                    result += reverse_ip_split[i-1]
+                    if i % 4 == 1 and i != 1
+                      result += ":"
+                    end
+                  end
+                end
+
+                if result
+                  event.set("[dns][question][ip]", result)
+                end
+              '
+            }
+          }
+
+          if [dns][question][name] and "reverse_dns_lookup" not in [tags] {
+            ruby {
+              init => '
+                uri = URI("https://raw.githubusercontent.com/publicsuffix/list/master/public_suffix_list.dat")
+                logger.info("Downloading the lastest public suffix list from " + uri.to_s())
+                
+                resp = Net::HTTP.get_response(uri)
+                if not resp.is_a?(Net::HTTPSuccess)
+                  raise "Failed to downlod the public suffix list. Status code: " + resp.code + " Response message: " + resp.message
+                end
+
+                logger.info("Successfully downloaded the public suffix list")
+
+                @suffixes = Set.new
+
+                lines = resp.body.split("\n")
+                lines.each { |line| 
+                  if not line.start_with?("//") and not line.empty?
+                    @suffixes.add(line)
+                  end
+                }
+
+                logger.info("Successfully loaded %d public suffixes" % [@suffixes.size()])
+              '
+              code => '
+                dns_question_name = event.get("[dns][question][name]")
+                
+                dns_question_name = dns_question_name.downcase
+                dns_question_name_split = dns_question_name.split(".")
+                if dns_question_name_split.size() < 2
+                  # logger.warn("Domain name %s appears to be invalid %s" % [ dns_question_name, event.get("[event][original]") ])
+                  
+                  # could be usefull to try and find if this values matches a known eTLD, especially because of DNSKEY records ???
+                  if @suffixes.include?(dns_question_name)
+                    event.set("[dns][question][top_level_domain]", dns_question_name)
+                  end
+                  
+                  return
+                end
+
+                match = nil     
+                for i in 1..dns_question_name_split.size() do
+                  top_level_domain = ""
+                  for j in i..dns_question_name_split.size()-1 do
+                    top_level_domain += dns_question_name_split[j].to_s()
+                    if j != dns_question_name_split.size()-1
+                      top_level_domain += + "."
+                    end
+                  end
+                    
+                  if @suffixes.include?(top_level_domain) 
+                    match = true
+                    registered_domain = dns_question_name_split[i-1].to_s() + "." + top_level_domain
+                    break
+                  end
+                end
+
+                unless match.nil?
+                  event.set("[dns][question][registered_domain]", registered_domain)
+                  event.set("[dns][question][top_level_domain]", top_level_domain)
+                  
+                  if dns_question_name != registered_domain
+                    event.set("[dns][question][subdomain]", dns_question_name.delete_suffix("." + registered_domain))
+                  end
+
+                  # logger.info("DNS Query: Name %s Registered name: %s eTLD %s SD %s" % [dns_question_name, registered_domain, top_level_domain, dns_question_name.delete_suffix("." + registered_domain)])
+                end
+              '
+            }
+          }  
+
+          if [tmp][type] == "rpz" {
+            ruby {
+              code => '
+             
+                dns_answers = []
+                dns_answers[0] = {
+                  "name" => event.get("[tmp][rpz_rewrite_name]"),
+                  "class" => event.get("[dns][question][class]"),
+                  "type" => event.get("[dns][question][type]"),
+                  "rpz_rewritten" => true
+                }
+
+                event.set("[dns][answers]", dns_answers)
+              '
+            }
+          }
+
+          ruby {
+            code => '
+              related_ips = [ ]
+              related_hosts = [ ]
+                
+              if event.get("[client][ip]")
+                related_ips.append(event.get("[client][ip]"))
+              end
+                
+              if event.get("[host][ip]")
+                related_ips.append(event.get("[host][ip]"))
+              end
+
+              if event.get("[dns][question][ip]")
+                related_ips.append(event.get("[dns][question][ip]"))
+              end
+
+              if event.get("[dns][question][name]")
+                related_hosts.append(event.get("[dns][question][name]"))
+              end
+
+              if event.get("[host][hostname]")
+                related_hosts.append(event.get("[host][hostname]"))
+              end
+
+              related_ips.uniq!
+              related_hosts.uniq!
+
+              if related_ips.size() > 0
+                event.set("[related][ip]", related_ips)
+              end
+
+              if related_hosts.size() > 0
+                event.set("[related][hosts]", related_hosts)
+              end
+            '
+          }
+
+          mutate {
+            remove_field => [
+              "[agent]",
+              "[log]",
+              "[host][name]",
+              "[tmp]"
+            ]
+          }
+        }
+        output {
+          if "_grokparsefailure" in [tags] {
+            stdout { codec => rubydebug }
+          }
+          elasticsearch {
+            hosts => [ "${SARAI_ES_HOSTS}" ]
+            user => "${SARAI_ES_USER}"
+            password => "${SARAI_ES_PASSWORD}"
+            ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+            data_stream => "true"
+            data_stream_type => "logs"
+            data_stream_dataset => "bind"
+            data_stream_namespace => "default"
+          }
+        }

@@ -1,0 +1,29 @@
+replicaCount: 3
+# disable me in production
+deleteTopicEnable: true
+autoCreateTopicsEnable: false
+persistence:
+  enabled: true
+  storageClass: "longhorn"
+  size: "16Gi"
+volumePermissions:
+  enabled: true
+kraft:
+  enabled: true
+  processRoles: "broker,controller"
+  controllerListenerNames: "CONTROLLER"
+  # if you touch this too much expect it to break
+  clusterId: "kafka_cluster_id_helk1"
+zookeeper:
+  enabled: false
+# without this Kraft doesn't initialize correctly
+service:
+  headless:
+    publishNotReadyAddresses: true
+resources:
+  requests:
+    cpu: 1
+    memory: 4Gi
+  limits:
+    cpu: 2
+    memory: 8Gi

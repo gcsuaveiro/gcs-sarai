@@ -1,0 +1,77 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-ingest-winlogbeat
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      volumes:
+      - name: certs
+        secret:
+          secretName: logstash-winlogbeat-certs
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx2g -Xms2g"
+            # kafka unused
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+          - name: KAFKA_TOPIC
+            value: "ingest-filebeat-winlogbeat"
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 4Gi
+        volumeMounts:
+          - name: certs
+            readOnly: true
+            mountPath: "/etc/winlogbeat"
+  services:
+    - name: winlogbeat
+      service:
+        spec:
+          type: NodePort
+          ports:
+            - port: 514
+              name: "winlogbeat"
+              protocol: TCP
+              targetPort: 9514
+              nodePort: 30600
+  pipelines:
+    - pipeline.id: ingest-winlogbeat
+      config.string: |
+        input {
+          beats {
+            port => 9514
+            ssl_certificate_authorities => [ "/etc/winlogbeat/rootCACert.pem" ]
+            ssl_certificate => "/etc/winlogbeat/rey.pem"
+            ssl_key => "/etc/winlogbeat/rey.key"
+            ssl_supported_protocols => "TLSv1.3"
+            ssl_enabled => true
+          }
+        }
+        filter {
+
+        }
+        output {
+          elasticsearch {
+            hosts => [ "${SARAI_ES_HOSTS}" ]
+            user => "${SARAI_ES_USER}"
+            password => "${SARAI_ES_PASSWORD}"
+            ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+            data_stream => "true"
+            data_stream_type => "logs"
+            data_stream_dataset => "windows.forwarded"
+            data_stream_namespace => "default"
+            http_compression => true
+          }
+        }

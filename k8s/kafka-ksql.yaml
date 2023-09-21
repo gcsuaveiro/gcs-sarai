@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: ksql-server
+  name: ksql-server
+spec:
+  podManagementPolicy: OrderedReady
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: ksql-server
+  serviceName: ""
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: ksql-server
+    spec:
+      containers:
+      - env:
+        - name: KSQL_BOOTSTRAP_SERVERS
+          value: kafka-bitnami.gcs-staging-2.svc.cluster.local:9092
+        - name: KSQL_LISTENERS
+          value: http://0.0.0.0:8088
+        - name: KSQL_KSQL_SERVICE_ID
+          value: wardog
+        - name: KSQL_CUB_KAFKA_TIMEOUT
+          value: "300"
+        - name: KSQL_KSQL_COMMIT_INTERVAL_MS
+          value: "2000"
+        - name: KSQL_KSQL_CACHE_MAX_BYTES_BUFFERING
+          value: "10000000"
+        - name: KSQL_KSQL_STREAMS_AUTO_OFFSET_RESET
+          value: earliest
+        - name: KSQL_HEAP_OPTS
+          value: -Xmx1g
+        - name: KSQL_OPTS
+          value: -Dconfluent.support.metrics.enable=false"
+        - name: KSQL_KSQL_EXTENSION_DIR
+          value: "/opt/ksqldb-udfs"
+        - name: KSQL_KSQL_FUNCTIONS_FORMULA_BASE_VALUE
+          value: "5"
+        image: pabreu31/gcs-ksql:test_anon15
+        imagePullPolicy: Always
+        name: ksql-server-container
+        ports:
+        - containerPort: 8088
+          protocol: TCP
+        resources: {}
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+          - name: udfs
+            mountPath: "/opt/ksqldb-udfs/"
+      volumes:
+        - name: udfs
+          persistentVolumeClaim:
+            claimName: ksql-temp-udfs-pvc
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+  updateStrategy:
+    rollingUpdate:
+      partition: 0
+    type: RollingUpdate
+---
+# ksqlDB CLI StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ksql-cli
+spec:
+  replicas: 1
+  serviceName: ksql-cli-svc
+  selector:
+    matchLabels:
+      app: ksql-cli
+  template:
+    metadata:
+      labels:
+        app: ksql-cli
+    spec:
+      containers:
+        - name: ksql-cli
+          image: confluentinc/ksqldb-cli:0.29.0
+          env:
+            - name: KSQL_HEAP_OPTS
+              value: "-Xmx1g"
+          command:
+            - /bin/sh
+          args:
+            - "-c"
+            - "sleep infinity"
+          tty: true
+---
+#  KsqlDB Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: ksql-server-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: ksql-server
+  ports:
+    - protocol: TCP
+      port: 8088
+      targetPort: 8088

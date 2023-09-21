@@ -1,0 +1,93 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-checkpoint-agent
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  # this a clean image with only the syslog output plugin installed
+  # https://www.elastic.co/guide/en/logstash/8.8/plugins-outputs-syslog.html
+  image: someonehuman/logstash:8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx4g -Xms4g"
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+          - name: CHECKPOINT_AGENT_HOST
+            value: "elastic-agent-parse-checkpoint"
+          - name: CHECKPOINT_AGENT_PORT
+            value: "9001"
+        resources:
+          requests:
+            memory: 8Gi
+          limits:
+            memory: 8Gi
+  pipelines:
+    - pipeline.id: checkpoint
+      config.string: |
+        input {
+          kafka {
+            bootstrap_servers => "${KAFKA_HOST}:${KAFKA_PORT}"
+            topics => ["ingest-filebeat-checkpoint"]
+            decorate_events => "basic"
+            codec => "json"
+            enable_auto_commit => true
+            auto_offset_reset => "earliest"
+            group_id => "SARAI_logstash"
+          }
+        }
+        filter {
+          if [message] == "" {
+            drop {}
+          }
+          
+          if [input][type] == "tcp" {
+            
+            grok {
+              match => { "message" => "(.*LEEF:%{NOTSPACE}\|%{DATA:vendor}\|%{DATA:product}\|%{DATA:version}\|%{WORD:action}\|)?%{GREEDYDATA:data}" }
+            }
+
+            if [vendor] == "Check Point" {
+              
+              mutate { 
+                gsub => [ "[data]", "[\t]", '"; ' ] 
+                gsub => [ "[data]", "(?<=[a-zA-Z0-9])=", ':"' ]
+                gsub => [ "[data]", '\\=', '=' ]
+                gsub => [ "[data]", "; srcPort:", "; s_port:" ]
+                add_field => { "[syslog]" => '[%{[data]}"]' }
+              }
+            } 
+          }
+        }
+        output {
+          if [input][type] == "tcp" and [vendor] == "Check Point" {
+            syslog {
+              host => "${CHECKPOINT_AGENT_HOST}"
+              port => "${CHECKPOINT_AGENT_PORT}"
+              protocol => "tcp"
+              rfc => "rfc5424"
+              codec => plain { format => "%{[syslog]}" }
+              message => "%{[syslog]}"
+              sourcehost => "%{[host][name]}"
+              procid => "1000"
+              msgid => ""
+            }
+          }
+          else {
+            elasticsearch {
+              hosts => [ "${SARAI_ES_HOSTS}" ]
+              user => "${SARAI_ES_USER}"
+              password => "${SARAI_ES_PASSWORD}"
+              cacert => "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}"
+            }
+          }
+        }

@@ -1,0 +1,66 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-ingest-suricata
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS
+            value: "-Xmx2g -Xms2g"
+            #KAFKA NOT USED ATM
+          - name: KAFKA_HOST
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+          - name: KAFKA_TOPIC
+            value: "ingest-filebeat-suricata"
+        resources:
+          requests:
+            memory: 4Gi
+          limits:
+            memory: 4Gi
+  services:
+    - name: filebeat
+      service:
+        spec:
+          type: NodePort
+          ports:
+            - port: 514
+              name: "filebeat"
+              protocol: TCP
+              targetPort: 9514
+              nodePort: 30601
+  pipelines:
+    - pipeline.id: ingest-suricata
+      config.string: |
+        input {
+          beats {
+            port => 9514
+            ssl_enabled => false
+          }
+        }
+        filter {
+
+        }
+        output {
+          elasticsearch {
+            hosts => [ "${SARAI_ES_HOSTS}" ]
+            user => "${SARAI_ES_USER}"
+            password => "${SARAI_ES_PASSWORD}"
+            ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+            data_stream => "true"
+            data_stream_type => "logs"
+            data_stream_dataset => "suricata.eve"
+            data_stream_namespace => "default"
+            http_compression => true
+            pipeline => "dummy"
+          }
+        }

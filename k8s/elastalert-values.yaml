@@ -1,0 +1,22 @@
+# helm repo add elastalert2 https://jertel.github.io/elastalert2/
+# helm repo update
+# helm install elastalert2 elastalert2/elastalert2 --values=elastalert.yaml
+
+elasticsearch:
+  host: "elasticsearch-es-http"
+  port: "9200"
+  useSsl: true
+  username: "elastic"
+  credentialsSecret: "elasticsearch-es-elastic-user"
+  credentialsSecretPasswordKey: "elastic"
+  verifyCerts: true
+  caCerts: "/mnt/ca.crt"
+  certsVolumes:
+    - name: es-ca-volume
+      secret:
+        secretName: elasticsearch-es-http-certs-public
+  certsVolumeMounts:
+    - name: es-ca-volume
+      mountPath: "/mnt/ca.crt"
+      subPath: "ca.crt"
+      readOnly: true

@@ -1,0 +1,255 @@
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-apache
+spec:
+  count: 1
+  elasticsearchRefs:
+    - name: elasticsearch
+      clusterName: helk
+  version: 8.8.2
+  podTemplate:
+    spec:
+      containers:
+      - name: logstash
+        env:
+          - name: LS_JAVA_OPTS   
+            value: "-Xmx1g -Xms1g"
+          - name: KAFKA_HOST 
+            value: "kafka-bitnami.gcs-staging-2.svc.cluster.local"
+          - name: KAFKA_PORT
+            value: "9092"
+        resources:
+          requests:
+            memory: 2Gi
+          limits:
+            memory: 2Gi
+  pipelines:
+    - pipeline.id: apache
+      config.string: |
+        input {
+          kafka {
+            bootstrap_servers => "${KAFKA_HOST}:${KAFKA_PORT}"
+            topics => ["anon-filebeat-apache"]
+            decorate_events => "none"
+            codec => "json"
+            enable_auto_commit => true
+            auto_offset_reset => "earliest"
+            group_id => "logstash_SARAI_apache_consumer_group"
+          }
+        }
+        filter {
+          if [message] == "" { drop {} }
+
+          mutate {
+            rename => {"[message]" => "[event][original]"}
+            add_field => { 
+              "[event][kind]" => "event" 
+              "[event][module]" => "apache"
+              "[event][category]" => "web"
+              "[event][type]" => "access"
+              "[event][created]" => "%{+yyyy-MM-dd'T'HH:mm:ss.SSS'Z'}"
+              "[event][dataset]" => "apache.access"
+            }
+          }
+
+          grok {
+            match => {"[event][original]" => "%{SYSLOGBASE} %{IP:[source][ip]} %{IP:[destination][ip]} - (?:-|%{DATA:[user][name]}) \[%{HTTPDATE:[apache][access][time]}\] \"(?:%{WORD:[http][request][method]} %{DATA:[url][original]} HTTP/%{NUMBER:[http][version]}|-)?\" %{NUMBER:[http][response][status_code]:int} %{NUMBER:[destination][port]:int} (?:%{NUMBER:[http][response][body][bytes]:int}|-) %{HOSTNAME:[destination][domain]}" }
+          }
+
+          date {
+            match => [ "[apache][access][time]", "dd/MMM/yyyy:H:m:s Z" ]
+            target => "@timestamp"
+            remove_field => [ "[timestamp]", "[apache][access][time]" ]
+          }
+
+          ruby {
+            code => '
+              url_original = event.get("[url][original]")
+              if url_original.nil? || url_original.strip.empty?
+                return
+              end 
+
+              dest_port = event.get("[destination][port]")
+              dest_domain = event.get("[destination][domain]")
+              
+              scheme = "unknown"
+              if dest_port == 443
+                scheme = "https"
+              elsif dest_port == 80
+                scheme = "http"
+              end
+
+              begin
+                uri = URI::parse(url_original)
+
+                if uri.host && uri.scheme                  
+                  logger.warn("Look at me!!!!!!!! #{event.get("[event][original]")}")
+                  unless uri.port == dest_port
+                    uri.port = dest_port
+                  end
+
+                  url_full = uri.to_s
+                else
+                  url_full = "#{scheme}://#{dest_domain}:#{dest_port}#{url_original}"
+                  uri = URI::parse(url_full)
+                end
+              rescue URI::Error
+                logger.warn("Failed to parse URI from event #{event.get("[event][original]")}")
+              else
+                if uri.path
+                  event.set("[url][path]", uri.path.to_s)
+
+                  extension = File.extname(uri.path.to_s)
+                  unless extension == ""
+                    event.set("[url][extension]", extension[1..-1])
+                  end
+                end
+
+                if uri.query
+                  event.set("[url][query]", uri.query.to_s)
+                end
+
+                if uri.fragment
+                  event.set("[url][fragment]", uri.fragment.to_s)
+                end
+
+                if uri.scheme
+                  event.set("[url][scheme]", uri.scheme.to_s)
+                end
+
+                if uri.port
+                  event.set("[url][port]", uri.port)
+                end
+
+                event.set("[url][full]", url_full)
+              end
+            '
+          }
+
+          mutate { 
+            copy => { 
+              "[destination][domain]" => "[url][domain]" 
+              "[process][name]" => "[event][provider]"
+            } 
+          }
+
+          if [http][response][status_code] {
+            if [http][response][status_code] < 400 {
+              mutate { add_field => { "[event][outcome]" => "success" } }
+            } 
+            else {
+              mutate { add_field => { "[event][outcome]" => "failure" } }
+            }
+          }
+
+          if [source][ip] {
+            cidr {
+              address => [ "%{[source][ip]}" ]
+              network => [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fe80::/64" ]
+              add_tag => [ "private_source_ip" ]
+            }
+
+            if "private_source_ip" not in [tags] {
+              geoip {
+                source => "[source][ip]"
+                target => "[source]"
+                default_database_type => "City"
+              }
+              geoip {
+                source => "[source][ip]"
+                target => "[source]"
+                default_database_type => "ASN"
+                fields => [ "AUTONOMOUS_SYSTEM_NUMBER", "AUTONOMOUS_SYSTEM_ORGANIZATION" ]
+              }
+            } 
+          }
+          
+          if [destination][ip] {
+            cidr {
+              address => [ "%{[destination][ip]}" ]
+              network => [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "fe80::/64" ]
+              add_tag => [ "private_destination_ip" ]
+            }
+
+            if "private_destination_ip" not in [tags] {
+              geoip {
+                source => "[destination][ip]"
+                target => "[destination]"
+                default_database_type => "City"
+              }
+              geoip {
+                source => "[destination][ip]"
+                target => "[destination]"
+                default_database_type => "ASN"
+                fields => [ "AUTONOMOUS_SYSTEM_NUMBER", "AUTONOMOUS_SYSTEM_ORGANIZATION" ]
+              }
+            }
+          }
+
+          ruby {
+            code => '
+              related_ips = []
+              related_hosts = []
+              related_user = []
+
+              if event.get("[source][ip]")
+                related_ips.append(event.get("[source][ip]"))
+              end
+
+              if event.get("[destination][ip]")
+                related_ips.append(event.get("[destination][ip]"))
+              end
+
+              if event.get("[destination][domain]")
+                related_hosts.append(event.get("[destination][domain]"))
+              end
+
+              if event.get("[host][hostname]")
+                related_hosts.append(event.get("[host][hostname]"))
+              end
+
+              if event.get("[user][name]")
+                related_user.append(event.get("[user][name]"))
+              end
+
+              related_ips.uniq!
+              related_hosts.uniq!
+              related_user.uniq!
+
+              if related_ips.size() > 0
+                event.set("[related][ip]", related_ips)
+              end
+
+              if related_hosts.size() > 0
+                event.set("[related][hosts]", related_hosts)
+              end
+
+              if related_user.size() > 0
+                event.set("[related][user]", related_user)
+              end
+            '
+          }
+
+          mutate { 
+            remove_field => [ 
+              "[agent]",
+              "[apache]", 
+              "[log]", 
+              "[host][name]",
+              "[input]"
+            ] 
+          }
+        }
+        output {
+          elasticsearch {
+            hosts => [ "${SARAI_ES_HOSTS}" ]
+            user => "${SARAI_ES_USER}"
+            password => "${SARAI_ES_PASSWORD}"
+            ssl_certificate_authorities => [ "${SARAI_ES_SSL_CERTIFICATE_AUTHORITY}" ]
+            data_stream => "true"
+            data_stream_type => "logs"
+            data_stream_dataset => "apache.access"
+            data_stream_namespace => "default"
+          }
+        }

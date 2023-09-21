@@ -1,0 +1,36 @@
+# Default values for filebeat-ingest.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+# Usage: helm upgrade --install -n gcs-staging-2 ingest-checkpoint . --set service.nodePort=30515 --set topic=filebeat
+
+#Probably can't use this but wtv
+replicaCount: 1
+
+#ES Configs
+version: 8.8.2
+elasticsearchRef: elasticsearch
+
+#Kafka
+kafka:
+  topic: "filebeat-lixo"
+  #List of hosts in a single comma-delimited string
+  hosts: '["kafka-bitnami-0.kafka-bitnami-headless.gcs-staging-2.svc.cluster.local:9092", "kafka-bitnami-1.kafka-bitnami-headless.gcs-staging-2.svc.cluster.local:9092", "kafka-bitnami-2.kafka-bitnami-headless.gcs-staging-2.svc.cluster.local:9092" ]'
+
+#Worker placement to avoid kube-proxy SNAT when definig NAT rules
+nodePlacement:
+  enabled: false
+  node: sarai-w-ns-1
+
+#Customize service ports, only change nodePort
+service:
+  type: NodePort
+  port: 9514
+  nodePort: 30514
+  
+resources:
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+  requests:
+    cpu: "200m"
+    memory: "128Mi"
